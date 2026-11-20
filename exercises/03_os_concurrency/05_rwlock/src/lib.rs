@@ -62,8 +62,26 @@ impl<T> RwLock<T> {
     /// 3. If reader count (state & READER_MASK) is already READER_MASK, spin and continue.
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        // TODO
-        todo!()
+        loop {
+            let s = self.state.load(Ordering::Acquire);
+            // Writer-priority: while a writer holds or is queued, new readers wait.
+            if s & (WRITER_HOLDING | WRITER_WAITING) != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            if (s & READER_MASK) == READER_MASK {
+                // Reader count saturated; cannot admit another without overflow.
+                core::hint::spin_loop();
+                continue;
+            }
+            match self
+                .state
+                .compare_exchange(s, s + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return RwLockReadGuard { lock: self },
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
@@ -74,8 +92,27 @@ impl<T> RwLock<T> {
     /// 3. Try compare_exchange(WRITER_WAITING, WRITER_HOLDING, ...) to take the lock; or compare_exchange(0, WRITER_HOLDING, ...) if a writer just released.
     /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        // TODO
-        todo!()
+        // Annulate the wait first: from now on every reader sees WRITER_WAITING
+        // and stops cutting in line, which is what prevents writer starvation.
+        self.state.fetch_or(WRITER_WAITING, Ordering::Release);
+        loop {
+            let s = self.state.load(Ordering::Acquire);
+            if s & WRITER_HOLDING != 0 || (s & READER_MASK) != 0 {
+                // A writer owns it, or readers are still draining.
+                core::hint::spin_loop();
+                continue;
+            }
+            // Lock is free; `s` is either WRITER_WAITING alone, or additionally
+            // carries waiting bits set by contending writers.
+            let next = s & !WRITER_WAITING | WRITER_HOLDING;
+            match self
+                .state
+                .compare_exchange(s, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return RwLockWriteGuard { lock: self },
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 }
 
@@ -90,7 +127,8 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Safe: at least one read lock is held, so no writer can mutate.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +136,8 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Subtracting 1 only touches the reader field, leaving both writer bits intact.
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +152,8 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Safe: the writer holds exclusive access.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,7 +161,7 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -129,7 +169,12 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 // Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Clearing both bits hands the lock to the next contender, which
+        // re-announces itself via WRITER_WAITING in `write()` if it is a writer;
+        // readers only proceed while no writer bit is set, so this cannot strand one.
+        self.lock
+            .state
+            .fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release);
     }
 }
 

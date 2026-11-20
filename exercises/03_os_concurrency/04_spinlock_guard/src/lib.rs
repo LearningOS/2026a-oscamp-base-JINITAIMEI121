@@ -39,9 +39,15 @@ impl<T> SpinLock<T> {
     ///
     /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        loop {
+            match self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return SpinGuard { lock: self },
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 }
 
@@ -51,7 +57,9 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Safe: this guard is the only holder of the lock, so no other thread
+        // can access the UnsafeCell while the guard is alive.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +67,7 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +75,9 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Release makes every access through the guard visible to the next
+        // acquirer; also runs on unwind, so a panic cannot leak the lock.
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
